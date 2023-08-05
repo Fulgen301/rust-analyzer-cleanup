@@ -1,4 +1,4 @@
-use std::{path::Path, sync::atomic::AtomicIsize};
+use std::{ffi::c_void, path::Path, sync::atomic::AtomicIsize};
 
 use windows::{
     core::{implement, ComInterface, BSTR, HRESULT, HSTRING, PCWSTR},
@@ -18,7 +18,9 @@ use windows::{
             Console::SetConsoleCtrlHandler,
             Diagnostics::Debug::WriteProcessMemory,
             LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, GetProcAddress},
-            Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE},
+            Memory::{
+                VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+            },
             Ole::{VariantClear, VariantInit},
             Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE},
             Threading::{
@@ -107,6 +109,33 @@ impl std::ops::Deref for Variant {
 impl std::ops::DerefMut for Variant {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+struct VirtualMemoryInProcess {
+    process: HANDLE,
+    memory: *mut c_void,
+}
+
+impl VirtualMemoryInProcess {
+    pub fn new(process: HANDLE, memory: *mut c_void) -> windows::core::Result<Self> {
+        if memory.is_null() {
+            return Err(windows::core::Error::from_win32());
+        } else {
+            Ok(Self { process, memory })
+        }
+    }
+
+    pub fn get(&self) -> *mut c_void {
+        self.memory
+    }
+}
+
+impl Drop for VirtualMemoryInProcess {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = VirtualFreeEx(self.process, self.memory, 0, MEM_RELEASE);
+        }
     }
 }
 
@@ -205,17 +234,20 @@ impl EventSink {
                 .into();
 
             let memory_size = (module_path.len() + 1) * std::mem::size_of::<u16>();
-            let memory = VirtualAllocEx(
+            let memory = VirtualMemoryInProcess::new(
                 handle.0,
-                None,
-                memory_size,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE,
-            );
+                VirtualAllocEx(
+                    handle.0,
+                    None,
+                    memory_size,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                ),
+            )?;
 
             if !WriteProcessMemory(
                 handle.0,
-                memory,
+                memory.get(),
                 module_path.as_ptr() as _,
                 memory_size,
                 None,
@@ -225,15 +257,17 @@ impl EventSink {
                 return Err(windows::core::Error::from_win32());
             }
 
-            CloseHandle(CreateRemoteThread(
+            let thread = CreateRemoteThread(
                 handle.0,
                 None,
                 0,
                 Some(std::mem::transmute(load_library)),
-                Some(memory),
+                Some(memory.get()),
                 0,
                 None,
-            )?);
+            )?;
+
+            WaitForSingleObject(thread, INFINITE);
         }
 
         Ok(())
